@@ -10,8 +10,8 @@ binding = "FILES_BUCKET"
 bucket_name = "<bucket_name>"
 
 # KV 命名空间 - 存放分享令牌元数据
-# 创建命令: npx wrangler kv namespace create <kv_name>
+# 创建命令: npx wrangler kv namespace create cloudshare_shares
 # 创建后将返回的 id 填入下方
 [[kv_namespaces]]
-binding = "<kv_name>"
+binding = "cloudshare_shares"
 id = "KV_ID"
