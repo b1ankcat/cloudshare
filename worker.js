@@ -42,7 +42,7 @@ function setDownloadHeaders(headers, object, filename) {
   headers.set('Content-Type', object.httpMetadata?.contentType || getMimeType(filename));
   headers.set('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`);
   headers.set('Accept-Ranges', 'bytes');
-  Object.entries(CACHE_HEADERS).forEach(([k, v]) => headers.set(k, v));
+  for (const [k, v] of Object.entries(CACHE_HEADERS)) headers.set(k, v);
   if (object.httpEtag) headers.set('ETag', object.httpEtag);
   object.writeHttpMetadata(headers);
 }
@@ -450,11 +450,9 @@ function normalizeObjectKey(path) {
 
 // ─── 文件去重 & 引用计数 ──────────────────────────────────────────────────
 const BLOB_PREFIX = '__blob__/';
-const HIDDEN_R2_KEYS = new Set([BLOB_PREFIX.slice(0, -1), '_root_']);
-const HIDDEN_R2_PREFIXES = [BLOB_PREFIX, '_root_/'];
 
 function isInternalR2Key(key) {
-  return HIDDEN_R2_KEYS.has(key) || HIDDEN_R2_PREFIXES.some(prefix => key.startsWith(prefix));
+  return key.startsWith(BLOB_PREFIX) || key.startsWith('_root_/') || key === '__blob__' || key === '_root_';
 }
 
 function isValidSha256(value) {
@@ -504,18 +502,22 @@ async function getRefCount(env, hash) {
 // 正常路径优先使用 KV 中记录好的 refCount。
 // 只有 refCount 归零、准备删除 blob 前，才扫描 R2 指针做最终确认；这是删除安全校验，不是兼容兜底。
 async function countObjectRefs(env, hash, excludeKey = '') {
-  let count = 0;
+  let realCount = 0;
   let cursor;
   do {
     const listed = await env.FILES_BUCKET.list({ cursor });
-    for (const obj of listed.objects) {
-      if (obj.key === excludeKey || isInternalR2Key(obj.key) || obj.size !== 0) continue;
-      const pointer = await env.FILES_BUCKET.head(obj.key);
-      if (pointer?.customMetadata?.sha256 === hash) count++;
+    const candidates = listed.objects.filter(
+      obj => obj.key !== excludeKey && !isInternalR2Key(obj.key) && obj.size === 0
+    );
+    if (candidates.length > 0) {
+      const heads = await Promise.all(candidates.map(obj => env.FILES_BUCKET.head(obj.key)));
+      for (const pointer of heads) {
+        if (pointer?.customMetadata?.sha256 === hash) realCount++;
+      }
     }
     cursor = listed.cursor;
   } while (cursor);
-  return count;
+  return realCount;
 }
 
 async function incrementRefCount(env, hash, size = 0, contentType = 'application/octet-stream') {
@@ -782,9 +784,9 @@ async function handleCreateFolder(request, env) {
 async function handleListFiles(request, env, params) {
   try {
     let folder = normalizeFolderPath(params?.folder || '');
-    // 确保 folder 结尾格式一致
     if (folder && !folder.endsWith('/')) folder += '/';
     const prefix = folder;
+    const cleanCurrentFolder = decodeFolderPath(folder.replace(/\/$/, ''));
 
     const listed = await listAllR2(env, { prefix, delimiter: '/' });
     const files = [];
@@ -796,56 +798,51 @@ async function handleListFiles(request, env, params) {
       if (isInternalR2Key(obj.key)) continue;
       const fileName = obj.key.slice(prefix.length);
       if (fileName === '.folder' || !fileName) continue;
-      
-      // 过滤掉由于底层结构深层嵌套，错误划归到此层的子孙级文件
-      if (fileName.includes('/')) continue; 
-
+      if (fileName.includes('/')) {
+        // 检测嵌套的 .folder 标记 → 提取下一层子文件夹
+        if (fileName.endsWith('/.folder')) {
+          const topSubFolder = fileName.split('/')[0];
+          if (topSubFolder && !folderSet.has(topSubFolder)) {
+            folders.push({ name: decodeURIComponent(topSubFolder), type: 'folder' });
+            folderSet.add(topSubFolder);
+          }
+        }
+        continue;
+      }
       files.push({
         name: decodeURIComponent(fileName),
         size: obj.size,
         uploaded: obj.uploaded,
         key: obj.key,
-        folder: decodeFolderPath(folder.replace(/\/$/, '')),
-        isDedup: obj.size === 0, // 0 字节 = 去重指针，需解析真实大小
+        folder: cleanCurrentFolder,
+        isDedup: obj.size === 0,
       });
     }
 
     // 2. 从 delimitedPrefixes 获取下一层子文件夹
     for (const p of listed.delimitedPrefixes || []) {
       if (isInternalR2Key(p)) continue;
-      const folderName = p.slice(prefix.length, -1); // 提取出当前层的子目录名
+      const folderName = p.slice(prefix.length, -1);
       if (folderName && !folderSet.has(folderName)) {
         folders.push({ name: decodeURIComponent(folderName), type: 'folder' });
         folderSet.add(folderName);
       }
     }
 
-    // 3. 补充检查带 .folder 标记的空专属文件夹
-    const cleanCurrentFolder = decodeFolderPath(folder.replace(/\/$/, ''));
-    const allListed = await listAllR2(env, { prefix });
-    for (const obj of allListed.objects) {
-      if (isInternalR2Key(obj.key)) continue;
-      if (obj.key.endsWith('/.folder')) {
-        const fullFolderDir = obj.key.slice(0, -8);
-        if (fullFolderDir.startsWith(prefix)) {
-          const relativePart = fullFolderDir.slice(prefix.length);
-          const topSubFolder = relativePart.split('/')[0]; // 只提取下一层
-          if (topSubFolder && !folderSet.has(topSubFolder)) {
-            folders.push({ name: decodeURIComponent(topSubFolder), type: 'folder' });
-            folderSet.add(topSubFolder);
-          }
-        }
-      }
-    }
-
-    // 4. 解析去重指针文件的真实大小和引用计数
-    for (const f of files) {
-      if (f.isDedup) {
+    // 3. 并行解析去重指针文件的真实大小和引用计数
+    const dedupFiles = files.filter(f => f.isDedup);
+    if (dedupFiles.length > 0) {
+      const results = await Promise.all(dedupFiles.map(async (f) => {
         const obj = await env.FILES_BUCKET.head(f.key);
         const sha = obj?.customMetadata?.sha256;
         if (!sha) throw new Error(`Dedup pointer missing sha256 metadata: ${f.key}`);
         const ref = await getRefCount(env, sha);
         if (!ref) throw new Error(`Dedup blob missing for file: ${f.key}`);
+        return { key: f.key, size: ref.size, refCount: ref.refCount };
+      }));
+      const refMap = new Map(results.map(r => [r.key, r]));
+      for (const f of dedupFiles) {
+        const ref = refMap.get(f.key);
         f.size = ref.size;
         f.refCount = ref.refCount;
         delete f.isDedup;
@@ -862,6 +859,20 @@ async function handleListFiles(request, env, params) {
 async function handleDeleteFile(request, env, folder, fileName) {
   try {
     const key = buildR2Key(folder, fileName);
+
+    // 检查是否有活跃分享，如果有则先取消
+    const shareKeys = await listAllSharesKV(env);
+    if (shareKeys.length > 0) {
+      const results = await Promise.all(shareKeys.map(sk => env.cloudshare_shares.get(sk.name, 'json')));
+      const deletePromises = [];
+      for (let i = 0; i < results.length; i++) {
+        const shareData = results[i];
+        if (shareData && shareData.type === 'file' && shareData.path === key) {
+          deletePromises.push(env.cloudshare_shares.delete(shareKeys[i].name));
+        }
+      }
+      if (deletePromises.length > 0) await Promise.all(deletePromises);
+    }
 
     await releaseObjectRef(env, key);
     await env.FILES_BUCKET.delete(key);
@@ -887,22 +898,28 @@ async function handleDeleteFolder(request, env, folder) {
       cursor = listed.cursor;
     } while (cursor);
 
-    // 批量删除
+    // 先释放所有引用计数（有副作用，需顺序执行）
     for (const key of keysToDelete) {
       await releaseObjectRef(env, key);
-      await env.FILES_BUCKET.delete(key);
+    }
+    // 批量删除 R2 对象（R2 支持每次最多 1000 个 key）
+    for (let i = 0; i < keysToDelete.length; i += 1000) {
+      const batch = keysToDelete.slice(i, i + 1000);
+      await env.FILES_BUCKET.delete(batch);
     }
 
     // 同时清理相关的分享
     if (env.cloudshare_shares) {
       const shareKeys = await listAllSharesKV(env);
+      const deletePromises = [];
       for (const shareKey of shareKeys) {
         const shareData = await env.cloudshare_shares.get(shareKey.name, 'json');
         const sharePath = shareData ? normalizeFolderPath(shareData.path) : '';
         if (shareData && (sharePath === folder || sharePath.startsWith(`${folder}/`))) {
-          await env.cloudshare_shares.delete(shareKey.name);
+          deletePromises.push(env.cloudshare_shares.delete(shareKey.name));
         }
       }
+      if (deletePromises.length > 0) await Promise.all(deletePromises);
     }
 
     return jsonResponse({ success: true, deleted: keysToDelete.length });
@@ -966,16 +983,18 @@ async function handleGetShare(request, env, token) {
         const folderPath = normalizeFolderPath(shareData.path);
         const prefix = folderPath ? `${folderPath}/` : '';
         const listed = await listAllR2(env, { prefix });
+        const visibleObjects = [];
         for (const obj of listed.objects) {
           if (isInternalR2Key(obj.key)) continue;
           const fileName = obj.key.slice(prefix.length);
           if (fileName === '.folder' || fileName.endsWith('/.folder') || !fileName) continue;
-          const fileInfo = await getVisibleFileInfo(env, obj.key, decodeURIComponent(fileName));
-          if (fileInfo) files.push(fileInfo);
+          visibleObjects.push({ key: obj.key, name: decodeURIComponent(fileName) });
         }
+        const results = await Promise.all(visibleObjects.map(o => getVisibleFileInfo(env, o.key, o.name)));
+        files = results.filter(Boolean);
       } else {
         const obj = await getVisibleFileInfo(env, normalizeObjectKey(shareData.path), shareData.name);
-        if (!obj) return errorResponse(`分享文件不存在: ${shareData.path}`, 404);
+        if (!obj) return errorResponse('分享文件不存在', 404);
         files.push({
           name: shareData.name,
           size: obj.size,
@@ -1037,7 +1056,7 @@ async function handleUpdateShare(request, env, token) {
         return jsonResponse({ success: true });
       }
       default:
-        return errorResponse('无效的 action: ' + action);
+        return errorResponse('无效的 action');
     }
 
     await env.cloudshare_shares.put(`share:${token}`, JSON.stringify(shareData));
@@ -1084,11 +1103,8 @@ async function handleVerifyPassword(request, env, token) {
 async function handleListShares(request, env) {
   try {
     const shareKeys = await listAllSharesKV(env);
-    const shares = [];
-    for (const key of shareKeys) {
-      const data = await env.cloudshare_shares.get(key.name, 'json');
-      if (data) shares.push(publicShareData(data));
-    }
+    const results = await Promise.all(shareKeys.map(key => env.cloudshare_shares.get(key.name, 'json')));
+    const shares = results.filter(Boolean).map(publicShareData);
     return jsonResponse({ shares });
   } catch (e) {
     return errorResponse('获取分享列表失败: ' + e.message, 500);
@@ -1978,7 +1994,7 @@ function downloadFile(folder, name) {
 async function deleteFile(folder, name) {
   const delResult = await showDialog({
     title: '🗑 删除文件', 
-    content: '确定删除 <strong>' + escapeHtml(name) + '</strong>？', 
+    content: '确定删除 ' + escapeHtml(name) + '？', 
     buttons: [{ text: '取消', cls: 'outline', value: null }, { text: '确认删除', cls: 'danger', value: 'ok' }]
   });
   if (!delResult || delResult.value !== 'ok') return;
@@ -2769,7 +2785,9 @@ export default {
       // GET /s/:token - 分享访问页面 (客户端动态渲染)
       if (request.method === 'GET' && pathname.startsWith('/s/')) {
         const token = pathname.slice(3).split('/')[0];
-        if (!token) return htmlResponse(notFoundHTML('无效的分享链接'), 404);
+        if (!token || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+          return htmlResponse(notFoundHTML('无效的分享链接'), 404);
+        }
 
         // 快速检查分享是否存在
         const shareData = await env.cloudshare_shares.get(`share:${token}`, 'json');
@@ -2786,6 +2804,9 @@ export default {
       if (request.method === 'GET' && pathname.startsWith('/dl/')) {
         const parts = pathname.slice(4).split('/').filter(Boolean);
         const token = parts[0];
+        if (!token || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token)) {
+          return errorResponse('无效的下载链接', 404);
+        }
         const filename = parts.length > 1 ? decodeURIComponent(parts.slice(1).join('/')) : null;
         return await handleDownload(request, env, token, filename);
       }
@@ -2991,7 +3012,10 @@ function managePageHTML() {
 <body>
 <div class="topbar">
   <h1><span>☁</span> CloudShare <span style="font-size:14px;color:var(--text-secondary);font-weight:400;">分享管理</span></h1>
-  <div style="display:flex;gap:14px;align-items:center;"><a href="/">← 返回文件管理</a><a href="/api/logout">退出登录</a></div>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <a href="/" class="btn btn-outline" style="text-decoration:none;">文件管理</a>
+    <a href="/api/logout" class="btn btn-outline" style="text-decoration:none;">退出登录</a>
+  </div>
 </div>
 <div class="container">
   <div id="sharesTable"></div>
@@ -3063,7 +3087,7 @@ loadShares();
 }
 
 function notFoundHTML(msg) {
-  const message = msg || '页面不存在';
+  const message = escapeHtmlText(msg || '页面不存在');
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
