@@ -1,0 +1,17 @@
+# Cloudflare Worker + R2 文件分享系统
+name = "cloudshare"
+main = "worker.js"
+compatibility_date = "2025-05-31"
+
+# R2 存储桶 - 存放所有上传文件
+# 创建命令: npx wrangler r2 bucket create <bucket_name>
+[[r2_buckets]]
+binding = "FILES_BUCKET"
+bucket_name = "<bucket_name>"
+
+# KV 命名空间 - 存放分享令牌元数据
+# 创建命令: npx wrangler kv namespace create <kv_name>
+# 创建后将返回的 id 填入下方
+[[kv_namespaces]]
+binding = "<kv_name>"
+id = "KV_ID"

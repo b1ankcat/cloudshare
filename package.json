@@ -1,0 +1,14 @@
+{
+  "name": "cloudshare",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker + R2 文件分享系统",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "ship": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.14.1"
+  }
+}
