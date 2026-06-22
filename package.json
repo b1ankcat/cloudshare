@@ -1,15 +1,31 @@
 {
   "name": "cloudshare",
   "version": "1.0.0",
-  "description": "Cloudflare Worker + R2 文件分享系统",
+  "description": "Cloudflare Worker + R2 file sharing system",
   "license": "GPL-3.0-only",
   "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.34.4",
   "scripts": {
     "dev": "wrangler dev",
     "ship": "wrangler deploy",
-    "tail": "wrangler tail"
+    "tail": "wrangler tail",
+    "test": "vitest run",
+    "test:unit": "vitest run --dir src",
+    "test:integration": "vitest run --dir test",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "wrangler": "^4.14.1"
+    "@cloudflare/vitest-pool-workers": "^0.16.18",
+    "@cloudflare/workers-types": "^4.20260621.1",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9",
+    "wrangler": "^4.103.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "@rolldown/binding-linux-x64-gnu": "1.0.3"
+    }
   }
 }
